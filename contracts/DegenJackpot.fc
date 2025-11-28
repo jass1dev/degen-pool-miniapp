@@ -1,0 +1,236 @@
+;; DegenLadder Jackpot FunC contract
+;; Transparent jackpot rounds with deterministic payouts
+
+#include "imports/stdlib.fc";
+
+const OP_BUY_KEYS = 0x424b4559;
+const OP_ADMIN_CONFIG = 0x41444d4e;
+const OP_FORCE_FINISH = 0x47474e44;
+
+const MIN_KEY_PRICE_TON = 1;
+const MAX_KEY_PRICE_TON = 50;
+const BASIS_POINTS = 10000;
+const MIN_OWNER_FEE_BPS = 400;
+const MAX_OWNER_FEE_BPS = 1500;
+
+(slice, int, int, int, int, int, int, int, int, cell, cell) load_state() inline {
+  slice ds = get_data().begin_parse();
+  slice admin = ds~load_msg_addr();
+  int price = ds~load_coins();
+  int owner_fee = ds~load_uint(16);
+  int round_id = ds~load_uint(32);
+  int keys_target = ds~load_uint(32);
+  int sold = ds~load_uint(32);
+  int auto_double = ds~load_uint(1);
+  int next_manual = ds~load_uint(32);
+  int pot = ds~load_coins();
+  cell participants = ds~load_ref();
+  cell server_seed = ds~load_ref();
+  return (admin, price, owner_fee, round_id, keys_target, sold, auto_double, next_manual, pot, participants, server_seed);
+}
+
+() save_state(slice admin, int price, int owner_fee, int round_id, int keys_target, int sold, int auto_double, int next_manual, int pot, cell participants, cell server_seed) inline {
+  var b = begin_cell();
+  b.store_slice(admin);
+  b.store_coins(price);
+  b.store_uint(owner_fee, 16);
+  b.store_uint(round_id, 32);
+  b.store_uint(keys_target, 32);
+  b.store_uint(sold, 32);
+  b.store_uint(auto_double, 1);
+  b.store_uint(next_manual, 32);
+  b.store_coins(pot);
+  b.store_ref(participants);
+  b.store_ref(server_seed);
+  set_data(b.end_cell());
+}
+
+(int) pct(int value, int bps) inline { return (value * bps) / BASIS_POINTS; }
+
+cell push_participant(cell dict, int index, slice addr, int client_seed) inline {
+  var val = begin_cell();
+  val.store_slice(addr);
+  val.store_uint(client_seed, 64);
+  return udict_set_ref(dict, 32, index, val.end_cell());
+}
+
+(slice, int) get_participant(cell dict, int index) inline {
+  var (cell_value, has) = udict_get_ref?(dict, 32, index);
+  throw_unless(501, has);
+  slice s = cell_value.begin_parse();
+  slice addr = s~load_msg_addr();
+  int client_seed = s~load_uint(64);
+  return (addr, client_seed);
+}
+
+int random_pick(cell entropy, int modulo, int salt) inline {
+  var c = begin_cell();
+  c.store_ref(entropy);
+  c.store_uint(salt, 32);
+  var h = cell_hash(c.end_cell());
+  return h % modulo;
+}
+
+cell mix_entropy(cell server_seed, int round_id, int lt, int now_ts) inline {
+  randomize_lt();
+  var b = begin_cell();
+  b.store_ref(server_seed);
+  b.store_uint(round_id, 32);
+  b.store_uint(lt, 64);
+  b.store_uint(now_ts, 32);
+  b.store_uint(get_seed(), 256);
+  return b.end_cell();
+}
+
+int calc_next_target(int current_target, int auto_double, int manual_target) inline {
+  if (auto_double == 1) {
+    return current_target * 2;
+  }
+  return manual_target;
+}
+
+() send_coins(slice to, int amount) inline {
+  var msg = begin_cell();
+  msg.store_uint(0x10, 6);
+  msg.store_slice(to);
+  msg.store_coins(amount);
+  msg.store_slice(null());
+  send_raw_message(msg.end_cell(), 1);
+}
+
+(int, int) pay_winners(cell participants, int sold, cell entropy, int winners, int share_bps, int prize_pool, int salt) inline {
+  if (winners == 0) {
+    return (0, salt);
+  }
+  if (share_bps == 0) {
+    return (0, salt);
+  }
+  int total_share = pct(prize_pool, share_bps);
+  int batch = total_share / winners;
+  int actual = sold < winners ? sold : winners;
+  int i = 0;
+  while (i < actual) {
+    int pick = random_pick(entropy, sold, salt + i);
+    var (addr, _) = get_participant(participants, pick);
+    send_coins(addr, batch);
+    i += 1;
+  }
+  return (batch * actual, salt + actual);
+}
+
+cell reset_participants() inline { return new_dict(); }
+
+(int) enforce_limits(int value, int min_value, int max_value, int err) inline {
+  throw_unless(err, value >= min_value);
+  throw_unless(err, value <= max_value);
+  return value;
+}
+
+() finish_round(slice admin, int price, int owner_fee, int round_id, int keys_target, int sold, int auto_double, int next_manual, int pot, cell participants, cell server_seed) inline {
+  throw_unless(700, sold == keys_target);
+  int owner_cut = pct(pot, owner_fee);
+  int prize_pool = pot - owner_cut;
+  send_coins(admin, owner_cut);
+
+  cell entropy = mix_entropy(server_seed, round_id, cur_lt(), now());
+  int salt = 0;
+  int distributed = 0;
+
+  var (main_paid, salt1) = pay_winners(participants, sold, entropy, 1, 1500, prize_pool, salt);
+  distributed += main_paid; salt = salt1;
+  var (tier3_paid, salt2) = pay_winners(participants, sold, entropy, 3, 300, prize_pool, salt);
+  distributed += tier3_paid; salt = salt2;
+  var (tier10_paid, salt3) = pay_winners(participants, sold, entropy, 10, 100, prize_pool, salt);
+  distributed += tier10_paid; salt = salt3;
+  var (tier100_paid, salt4) = pay_winners(participants, sold, entropy, 100, 25, prize_pool, salt);
+  distributed += tier100_paid; salt = salt4;
+
+  int remaining = prize_pool - distributed;
+  if (remaining > 0) {
+    if (sold > 0) {
+      int per = remaining / sold;
+      int idx = 0;
+      while (idx < sold) {
+        var (addr2, _) = get_participant(participants, idx);
+        send_coins(addr2, per);
+        idx += 1;
+      }
+    }
+  }
+
+  int new_round = round_id + 1;
+  int new_target = calc_next_target(keys_target, auto_double, next_manual);
+  save_state(admin, price, owner_fee, new_round, new_target, 0, auto_double, next_manual, 0, reset_participants(), server_seed);
+}
+
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) {
+  var cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender = cs~load_msg_addr();
+  cs~load_msg_addr();
+  cs~skip_bits(2 * 64 + 1 + 64 + 32);
+
+  slice body = in_msg_body;
+  
+  ;; If empty message (deploy), just return - stateInit already initialized the data
+  if (body.slice_empty?()) {
+    return ();
+  }
+  
+  int op = body~load_uint(32);
+  var (admin, price, owner_fee, round_id, keys_target, sold, auto_double, next_manual, pot, participants, server_seed) = load_state();
+
+  if (op == OP_BUY_KEYS) {
+    int amount = body~load_uint(32);
+    int client_seed = body~load_uint(64);
+    throw_unless(400, amount > 0);
+    throw_unless(401, sold + amount <= keys_target);
+    int due = price * amount;
+    throw_unless(402, msg_value >= due);
+    int i = 0;
+    while (i < amount) {
+      participants = push_participant(participants, sold + i, sender, client_seed + i);
+      i += 1;
+    }
+    pot += msg_value;
+    sold += amount;
+    if (sold == keys_target) {
+      finish_round(admin, price, owner_fee, round_id, keys_target, sold, auto_double, next_manual, pot, participants, server_seed);
+      return ();
+    }
+    save_state(admin, price, owner_fee, round_id, keys_target, sold, auto_double, next_manual, pot, participants, server_seed);
+    return ();
+  }
+
+  throw_unless(600, equal_slices_bits(sender, admin));
+
+  if (op == OP_ADMIN_CONFIG) {
+    int new_price = body~load_uint(64);
+    int new_fee = body~load_uint(16);
+    int new_target = body~load_uint(32);
+    int auto_flag = body~load_uint(1);
+    price = enforce_limits(new_price, MIN_KEY_PRICE_TON * 1000000000, MAX_KEY_PRICE_TON * 1000000000, 601);
+    owner_fee = enforce_limits(new_fee, MIN_OWNER_FEE_BPS, MAX_OWNER_FEE_BPS, 602);
+    next_manual = enforce_limits(new_target, 10, 1000000, 603);
+    auto_double = auto_flag;
+    save_state(admin, price, owner_fee, round_id, keys_target, sold, auto_double, next_manual, pot, participants, server_seed);
+    return ();
+  }
+
+  if (op == OP_FORCE_FINISH) {
+    finish_round(admin, price, owner_fee, round_id, keys_target, sold, auto_double, next_manual, pot, participants, server_seed);
+    return ();
+  }
+
+  throw(604);
+}
+
+(int, int, int, int, int, int, int) get_round_state() method_id {
+  var (_, price, owner_fee, round_id, keys_target, sold, auto_double, _, pot, _, _) = load_state();
+  return (price, owner_fee, round_id, keys_target, sold, auto_double, pot);
+}
+
+cell get_participants_dict() method_id {
+  var (_, _, _, _, _, _, _, _, _, participants, _) = load_state();
+  return participants;
+}
