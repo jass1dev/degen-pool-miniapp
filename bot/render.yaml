@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: degen-pool-bot
+    env: node
+    rootDir: bot
+    buildCommand: npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+    healthCheckPath: /health
+
