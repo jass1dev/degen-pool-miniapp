@@ -1,4 +1,4 @@
-# DegenLadder Jackpot
+# DegenLadder 
 
 Полностью прозрачный TON джекпот: FunC контракт + Telegram бот (grammy + Fastify + TonConnect) + WebApp (Vite + React + Tailwind).
 
